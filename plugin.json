@@ -1,18 +1,19 @@
 {
   "name": "vpn-deck",
-  "author": "mrwaip",
+  "author": "Einharr / MrWaip",
   "flags": [
     "root"
   ],
   "api_version": 1,
   "publish": {
     "tags": [
-      "amnezia",
-      "root",
+      "vpn",
+      "wireguard",
       "amneziawg",
-      "vpn"
+      "awg3",
+      "root"
     ],
-    "description": "AmneziaWG VPN toggle for Decky Loader",
+    "description": "WireGuard + AmneziaWG 1.x/2/3 manager for Steam Deck Game Mode",
     "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
   }
 }
