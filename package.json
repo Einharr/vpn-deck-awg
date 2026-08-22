@@ -1,12 +1,12 @@
 {
-  "name": "vpn-deck",
-  "version": "2.3.0",
-  "description": "AmneziaWG VPN toggle for Decky Loader",
+  "name": "vpn-deck-awg",
+  "version": "3.0.0-beta.1",
+  "description": "Universal WireGuard and AmneziaWG manager for Decky Loader",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "python3 -m unittest test_protocol.py test_unit.py test_plugin_smoke.py",
     "release": "release-it",
     "release:patch": "release-it patch",
     "release:minor": "release-it minor",
@@ -14,23 +14,22 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mrwaip/vpn-deck.git"
+    "url": "git+https://github.com/Einharr/vpn-deck-awg.git"
   },
   "keywords": [
     "decky",
-    "plugin",
     "steam-deck",
-    "deck",
     "vpn",
-    "amnezia",
-    "amneziawg"
+    "wireguard",
+    "amneziawg",
+    "awg3"
   ],
-  "author": "mrwaip",
+  "author": "Einharr; based on vpn-deck by MrWaip",
   "license": "BSD-3-Clause",
   "bugs": {
-    "url": "https://github.com/mrwaip/vpn-deck/issues"
+    "url": "https://github.com/Einharr/vpn-deck-awg/issues"
   },
-  "homepage": "https://github.com/mrwaip/vpn-deck#readme",
+  "homepage": "https://github.com/Einharr/vpn-deck-awg#readme",
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
     "@decky/ui": "^4.11.0",

@@ -1,45 +1,71 @@
-name: Build AmneziaWG Binaries
+name: Build Decky Package
 
 on:
   workflow_dispatch:
-    inputs:
-      debug:
-        description: 'Enable debug output'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
   pull_request:
-    paths:
-      - '.github/workflows/build-binaries.yml'
-      - 'infra/**'
+
 jobs:
-  build-binaries:
-    name: Build AmneziaWG binaries for SteamOS (Steam Deck)
+  package:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/mrwaip/vpn-deck-builder:latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Copy binaries from container
-        run: |
-          mkdir -p binaries
-          cp -a /binaries/. binaries/
-
-      - name: Create binaries archive
-        run: |
-          tar -czf amneziawg-binaries-steamos-amd64.tar.gz -C binaries .
-          tar -tzf amneziawg-binaries-steamos-amd64.tar.gz
-          ls -lh amneziawg-binaries-steamos-amd64.tar.gz
-
-      - name: Upload binaries as artifact
-        uses: actions/upload-artifact@v4
+      - uses: pnpm/action-setup@v4
         with:
-          name: amneziawg-binaries-steamos-amd64
-          path: amneziawg-binaries-steamos-amd64.tar.gz
-          retention-days: 90
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          test -s dist/index.js
+
+      - name: Build pinned SteamOS runtime
+        run: |
+          docker build -f infra/Dockerfile -t vpn-deck-awg-builder .
+          cid=$(docker create vpn-deck-awg-builder /bin/true)
+          mkdir -p binaries
+          docker cp "$cid:/binaries/." binaries/
+          docker rm "$cid"
+          test -x binaries/amneziawg-go
+          test -x binaries/awg
+          test -x binaries/awg-quick
+          grep -q 'endpoint-direct-route' binaries/awg-quick
+          cat binaries/versions.json
+
+      - name: Package Decky plugin
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          ROOT="stage/vpn-deck"
+          mkdir -p "$ROOT/bin"
+          cp -a dist py_modules "$ROOT/"
+          cp -a binaries/amneziawg-go binaries/awg binaries/awg-quick binaries/versions.json "$ROOT/bin/"
+          cp main.py package.json plugin.json LICENSE README.md README.ru.md "$ROOT/"
+          chmod 0755 "$ROOT/bin/amneziawg-go" "$ROOT/bin/awg" "$ROOT/bin/awg-quick"
+          (cd stage && zip -r "../vpn-deck-awg-v${VERSION}.zip" vpn-deck)
+          unzip -l "vpn-deck-awg-v${VERSION}.zip"
+          unzip -p "vpn-deck-awg-v${VERSION}.zip" vpn-deck/plugin.json >/dev/null
+          unzip -p "vpn-deck-awg-v${VERSION}.zip" vpn-deck/dist/index.js >/dev/null
+          unzip -p "vpn-deck-awg-v${VERSION}.zip" vpn-deck/main.py >/dev/null
+          unzip -p "vpn-deck-awg-v${VERSION}.zip" vpn-deck/bin/amneziawg-go >/dev/null
+          echo "PACKAGE=vpn-deck-awg-v${VERSION}.zip" >> "$GITHUB_ENV"
+
+      - name: Archive runtime
+        run: tar -czf amneziawg-runtime-steamos-amd64.tar.gz -C binaries .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpn-deck-awg-decky-zip
+          path: ${{ env.PACKAGE }}
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-runtime-steamos-amd64
+          path: amneziawg-runtime-steamos-amd64.tar.gz
+          retention-days: 30

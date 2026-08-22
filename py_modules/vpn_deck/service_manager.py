@@ -1,28 +1,33 @@
-"""
-ServiceManager - Manages AmneziaWG interface lifecycle via awg-quick
-"""
+"""Lifecycle and status management for WireGuard/AmneziaWG profiles."""
+
+from __future__ import annotations
 
 import os
+import re
 import subprocess
 from datetime import datetime
+from typing import Dict, List, Optional, Set
 
 import decky
 
 from ._utils import clean_env
 
-MANAGED_PREFIX = "vd-"
-DEFAULT_INTERFACE = "awg0"
 
-# awg-quick up/down может долго выполняться (маршруты, DNS, резолвы)
+MANAGED_PREFIX = "vd-"
 START_STOP_TIMEOUT_SEC = 60
 AWG_QUICK_LOG = os.path.join(decky.DECKY_PLUGIN_LOG_DIR, "awg-quick.log")
+INTERFACE_RE = re.compile(r"^[a-zA-Z0-9_=+.-]{1,15}$")
 
 
 class ServiceManager:
-    def __init__(self, binary_manager):
+    def __init__(self, binary_manager) -> None:
         self.binary_manager = binary_manager
 
-    def _run(self, cmd: list, timeout: int = 10, quiet: bool = False):
+    @staticmethod
+    def _safe_interface(interface: str) -> bool:
+        return bool(INTERFACE_RE.fullmatch(interface or ""))
+
+    def _run(self, cmd: List[str], timeout: int = 10, quiet: bool = False):
         log = decky.logger.debug if quiet else decky.logger.info
         log(f"Running: {' '.join(str(c) for c in cmd)}")
         try:
@@ -31,29 +36,20 @@ class ServiceManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=clean_env()
+                env=clean_env(),
+                check=False,
             )
-            return (result.returncode, result.stdout.strip(), result.stderr.strip())
+            return result.returncode, result.stdout.strip(), result.stderr.strip()
         except subprocess.TimeoutExpired:
-            decky.logger.warning(
-                f"Command timed out after {timeout}s: {' '.join(str(c) for c in cmd)}"
-            )
-            return (1, "", f"timeout after {timeout}s")
+            return 1, "", f"timeout after {timeout}s"
         except FileNotFoundError:
-            decky.logger.warning(f"Command not found: {cmd[0]}")
-            return (127, "", f"{cmd[0]}: command not found")
+            return 127, "", f"{cmd[0]}: command not found"
 
-    def _run_logged(self, cmd: list, timeout: int = 60):
-        """Run a long-lived command with output redirected to a log file.
-
-        awg-quick spawns background processes that inherit pipe FDs,
-        causing subprocess.run with capture_output=True to hang.
-        Writing to a file + start_new_session avoids this.
-        """
-        cmd_str = ' '.join(str(c) for c in cmd)
-        decky.logger.info(f"Running (logged): {cmd_str}")
+    def _run_logged(self, cmd: List[str], timeout: int = START_STOP_TIMEOUT_SEC):
+        cmd_str = " ".join(str(c) for c in cmd)
         try:
-            with open(AWG_QUICK_LOG, "a") as log_file:
+            os.makedirs(os.path.dirname(AWG_QUICK_LOG), exist_ok=True)
+            with open(AWG_QUICK_LOG, "a", encoding="utf-8") as log_file:
                 log_file.write(f"\n--- {datetime.now().isoformat()} | {cmd_str} ---\n")
                 log_file.flush()
                 result = subprocess.run(
@@ -64,157 +60,166 @@ class ServiceManager:
                     timeout=timeout,
                     start_new_session=True,
                     env=clean_env(),
+                    check=False,
                 )
                 log_file.write(f"--- RC: {result.returncode} ---\n")
 
-            # Read tail of log for error reporting
-            stderr = ""
+            error_tail = ""
             if result.returncode != 0:
-                try:
-                    with open(AWG_QUICK_LOG, "r") as f:
-                        lines = f.readlines()
-                        stderr = "".join(lines[-20:]).strip()
-                except OSError:
-                    pass
-
-            return (result.returncode, "", stderr)
+                error_tail = self.get_log_tail(24)
+            return result.returncode, "", error_tail
         except subprocess.TimeoutExpired:
-            decky.logger.warning(f"Command timed out after {timeout}s: {cmd_str}")
-            return (1, "", f"timeout after {timeout}s")
+            return 1, "", f"timeout after {timeout}s"
         except FileNotFoundError:
-            decky.logger.warning(f"Command not found: {cmd[0]}")
-            return (127, "", f"{cmd[0]}: command not found")
+            return 127, "", f"{cmd[0]}: command not found"
+        except OSError as exc:
+            return 1, "", str(exc)
 
-    # ── Why _run_logged instead of _run for start/stop ──────────────
-    # awg-quick is a bash script that spawns `amneziawg-go` as a
-    # background daemon.  The daemon inherits pipe FDs created by
-    # subprocess.run(capture_output=True), so the parent process
-    # blocks forever waiting for EOF on those pipes.
-    #
-    # _run_logged redirects output to a file and uses
-    # start_new_session=True so child processes don't inherit our FDs.
-    # ─────────────────────────────────────────────────────────────────
+    def get_log_tail(self, lines: int = 60) -> str:
+        try:
+            with open(AWG_QUICK_LOG, "r", encoding="utf-8", errors="replace") as handle:
+                return "".join(handle.readlines()[-max(1, min(lines, 200)):]).strip()
+        except OSError:
+            return ""
 
-    def start_interface(self, interface: str) -> dict:
-        awg_quick_path = self.binary_manager.get_binary_path("awg-quick")
-        if awg_quick_path is None:
+    def active_interfaces(self) -> Set[str]:
+        awg = self.binary_manager.get_binary_path("awg")
+        if not awg:
+            return set()
+        rc, stdout, _ = self._run([awg, "show", "interfaces"], quiet=True)
+        return set(stdout.split()) if rc == 0 and stdout else set()
+
+    def start_interface(self, interface: str) -> Dict:
+        if not self._safe_interface(interface):
+            return {"success": False, "interface": interface, "method": None, "error": "Invalid interface name"}
+        if interface in self.active_interfaces():
+            return {"success": True, "interface": interface, "method": "already-active", "error": None}
+
+        awg_quick = self.binary_manager.get_binary_path("awg-quick")
+        if not awg_quick:
             return {"success": False, "interface": interface, "method": None, "error": "awg-quick binary not found"}
 
-        rc, _, stderr = self._run_logged(
-            [awg_quick_path, "up", interface],
-            timeout=START_STOP_TIMEOUT_SEC,
-        )
+        rc, _, stderr = self._run_logged([awg_quick, "up", interface])
         if rc == 0:
-            decky.logger.info(f"Started {interface} via awg-quick")
             return {"success": True, "interface": interface, "method": "awg-quick", "error": None}
-
-        err_msg = stderr or f"awg-quick up failed (rc={rc})"
-        decky.logger.error(f"Failed to start {interface}: {err_msg}")
-        return {"success": False, "interface": interface, "method": "awg-quick", "error": err_msg}
-
-    def stop_interface(self, interface: str) -> dict:
-        awg_quick_path = self.binary_manager.get_binary_path("awg-quick")
-        if awg_quick_path is None:
-            return {"success": False, "interface": interface, "method": None, "error": "awg-quick binary not found"}
-
-        rc, _, stderr = self._run_logged(
-            [awg_quick_path, "down", interface],
-            timeout=START_STOP_TIMEOUT_SEC,
-        )
-        if rc == 0:
-            decky.logger.info(f"Stopped {interface} via awg-quick")
-            return {"success": True, "interface": interface, "method": "awg-quick", "error": None}
-
-        decky.logger.error(f"Failed to stop {interface}: {stderr}")
-        return {"success": False, "interface": interface, "method": "awg-quick", "error": stderr or f"awg-quick down failed (rc={rc})"}
-
-    def get_status(self, interface: str) -> dict:
-        awg_path = self.binary_manager.get_binary_path("awg")
-
-        if awg_path:
-            rc, stdout, _ = self._run([awg_path, "show", interface], quiet=True)
-            is_up = rc == 0
-            peers = self._parse_awg_show(stdout) if is_up else []
-            status = "active" if is_up else "inactive"
-        else:
-            decky.logger.warning("awg binary not found, cannot get interface status")
-            peers = []
-            status = "unknown"
-
         return {
+            "success": False,
             "interface": interface,
-            "status": status,
-            "peers": peers,
+            "method": "awg-quick",
+            "error": stderr or f"awg-quick up failed (rc={rc})",
         }
 
-    def _parse_awg_show(self, output: str) -> list:
-        peers = []
-        current_peer = None
+    def stop_interface(self, interface: str) -> Dict:
+        if not self._safe_interface(interface):
+            return {"success": False, "interface": interface, "method": None, "error": "Invalid interface name"}
+        if interface not in self.active_interfaces():
+            return {"success": True, "interface": interface, "method": "already-inactive", "error": None}
 
+        awg_quick = self.binary_manager.get_binary_path("awg-quick")
+        if not awg_quick:
+            return {"success": False, "interface": interface, "method": None, "error": "awg-quick binary not found"}
+        rc, _, stderr = self._run_logged([awg_quick, "down", interface])
+        if rc == 0:
+            return {"success": True, "interface": interface, "method": "awg-quick", "error": None}
+        return {
+            "success": False,
+            "interface": interface,
+            "method": "awg-quick",
+            "error": stderr or f"awg-quick down failed (rc={rc})",
+        }
+
+    def activate_interface(self, interface: str, exclusive: bool = True) -> Dict:
+        if not self._safe_interface(interface):
+            return {"success": False, "interface": interface, "error": "Invalid interface name", "stopped": []}
+
+        stopped: List[str] = []
+        failed: List[Dict] = []
+        if exclusive:
+            for other in sorted(self.active_interfaces()):
+                if other == interface or not other.startswith(MANAGED_PREFIX):
+                    continue
+                result = self.stop_interface(other)
+                if result["success"]:
+                    stopped.append(other)
+                else:
+                    failed.append({"interface": other, "error": result.get("error")})
+            if failed:
+                return {
+                    "success": False,
+                    "interface": interface,
+                    "error": "Could not stop an existing managed VPN",
+                    "stopped": stopped,
+                    "failed": failed,
+                }
+
+        result = self.start_interface(interface)
+        result["stopped"] = stopped
+        return result
+
+    def _parse_awg_show(self, output: str) -> List[Dict]:
+        peers: List[Dict] = []
+        current: Optional[Dict] = None
         for line in output.splitlines():
             if line.startswith("peer:"):
-                if current_peer is not None:
-                    peers.append(current_peer)
-                current_peer = {
+                if current is not None:
+                    peers.append(current)
+                current = {
                     "public_key": line[len("peer:"):].strip(),
                     "endpoint": None,
                     "latest_handshake": None,
                     "transfer_rx": None,
                     "transfer_tx": None,
                 }
-            elif current_peer is not None:
-                stripped = line.strip()
-                if stripped.startswith("endpoint:"):
-                    current_peer["endpoint"] = stripped[len("endpoint:"):].strip()
-                elif stripped.startswith("latest handshake:"):
-                    current_peer["latest_handshake"] = stripped[len("latest handshake:"):].strip()
-                elif stripped.startswith("transfer:"):
-                    transfer = stripped[len("transfer:"):].strip()
-                    # "1.23 MiB received, 456 KiB sent"
-                    parts = transfer.split(",")
-                    for part in parts:
-                        part = part.strip()
-                        if "received" in part:
-                            current_peer["transfer_rx"] = part.replace("received", "").strip()
-                        elif "sent" in part:
-                            current_peer["transfer_tx"] = part.replace("sent", "").strip()
-
-        if current_peer is not None:
-            peers.append(current_peer)
-
+                continue
+            if current is None:
+                continue
+            stripped = line.strip()
+            if stripped.startswith("endpoint:"):
+                current["endpoint"] = stripped[len("endpoint:"):].strip()
+            elif stripped.startswith("latest handshake:"):
+                current["latest_handshake"] = stripped[len("latest handshake:"):].strip()
+            elif stripped.startswith("transfer:"):
+                parts = stripped[len("transfer:"):].strip().split(",")
+                for part in parts:
+                    text = part.strip()
+                    if "received" in text:
+                        current["transfer_rx"] = text.replace("received", "").strip()
+                    elif "sent" in text:
+                        current["transfer_tx"] = text.replace("sent", "").strip()
+        if current is not None:
+            peers.append(current)
         return peers
 
-    def get_all_statuses(self) -> list:
-        awg_path = self.binary_manager.get_binary_path("awg")
-        if awg_path is None:
-            decky.logger.warning("awg binary not found, cannot list interfaces")
-            return []
+    def get_status(self, interface: str) -> Dict:
+        active = interface in self.active_interfaces()
+        result = {"interface": interface, "status": "active" if active else "inactive", "peers": []}
+        if not active:
+            return result
+        awg = self.binary_manager.get_binary_path("awg")
+        if not awg:
+            result["status"] = "unknown"
+            return result
+        rc, stdout, stderr = self._run([awg, "show", interface], quiet=True)
+        if rc != 0:
+            result["status"] = "unknown"
+            result["error"] = stderr or "awg show failed"
+            return result
+        result["peers"] = self._parse_awg_show(stdout)
+        return result
 
-        rc, stdout, _ = self._run([awg_path, "show", "interfaces"], quiet=True)
-        if rc != 0 or not stdout:
-            return []
+    def get_all_statuses(self) -> List[Dict]:
+        return [self.get_status(interface) for interface in sorted(self.active_interfaces())]
 
-        ifaces = stdout.split()
-        return [self.get_status(iface) for iface in ifaces]
-
-    def stop_all_interfaces(self, only_managed: bool = False) -> dict:
-        awg_path = self.binary_manager.get_binary_path("awg")
-        if awg_path is None:
-            return {"stopped": [], "failed": [], "total": 0}
-
-        rc, stdout, _ = self._run([awg_path, "show", "interfaces"])
-        ifaces = stdout.split() if rc == 0 and stdout else []
-
+    def stop_all_interfaces(self, only_managed: bool = False) -> Dict:
+        interfaces = sorted(self.active_interfaces())
         if only_managed:
-            ifaces = [i for i in ifaces if i.startswith(MANAGED_PREFIX)]
-
-        stopped = []
-        failed = []
-        for iface in ifaces:
-            result = self.stop_interface(iface)
+            interfaces = [item for item in interfaces if item.startswith(MANAGED_PREFIX)]
+        stopped: List[str] = []
+        failed: List[Dict] = []
+        for interface in interfaces:
+            result = self.stop_interface(interface)
             if result["success"]:
-                stopped.append(iface)
+                stopped.append(interface)
             else:
-                failed.append(iface)
-
-        return {"stopped": stopped, "failed": failed, "total": len(ifaces)}
+                failed.append({"interface": interface, "error": result.get("error")})
+        return {"stopped": stopped, "failed": failed, "total": len(interfaces), "success": not failed}
