@@ -169,21 +169,47 @@ class EndpointBypass:
         return {"success": True, "error": None, "resolved": created}
 
     def verify(self, interface: str, resolved: List[Dict]) -> Dict:
+        """Verify endpoint protection without treating `route get` as authority.
+
+        `awg-quick` deliberately installs policy routing. On SteamOS, `ip route
+        get` can report the tunnel route even while an earlier destination rule
+        correctly forces the actual transport through `main`. The RPDB rule is
+        therefore authoritative; `route get` is retained only as diagnostics
+        and as a fallback when no explicit rule exists.
+        """
         checks = []
         for item in resolved:
-            rc, stdout, stderr = self._run(
+            rc_rules, rules_out, rules_err = self._run(
+                ["ip", item["proto"], "rule", "show"],
+                quiet=True,
+            )
+            rule_text = rules_out or rules_err
+            direct_rule = (
+                rc_rules == 0
+                and f"to {item['cidr']}" in rules_out
+                and ("lookup main" in rules_out or "table main" in rules_out)
+            )
+
+            rc_route, stdout, stderr = self._run(
                 ["ip", item["proto"], "route", "get", item["ip"]],
                 quiet=True,
             )
             route = stdout or stderr
-            ok = rc == 0 and bool(stdout) and f"dev {interface}" not in stdout
-            checks.append({"ip": item["ip"], "ok": ok, "route": route})
+            physical_route = rc_route == 0 and bool(stdout) and f"dev {interface}" not in stdout
+            ok = direct_rule or physical_route
+            checks.append({
+                "ip": item["ip"],
+                "ok": ok,
+                "direct_rule": direct_rule,
+                "rules": rule_text,
+                "route": route,
+            })
 
         failed = [item for item in checks if not item["ok"]]
         if failed:
             return {
                 "success": False,
-                "error": "VPN endpoint is routed into the tunnel: " + "; ".join(item["route"] for item in failed),
+                "error": "No main-table protection found for VPN endpoint: " + "; ".join(item["route"] for item in failed),
                 "checks": checks,
             }
         return {"success": True, "error": None, "checks": checks}
