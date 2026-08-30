@@ -128,6 +128,27 @@ class EndpointBypassTests(unittest.TestCase):
             self.commands,
         )
 
+    def test_policy_rule_wins_even_if_route_get_reports_tunnel(self):
+        def fake_run(cmd, timeout=10, quiet=False):
+            if cmd[-2:] == ["rule", "show"]:
+                return 0, "9990: from all to 203.0.113.10 lookup main", ""
+            if "route" in cmd and "get" in cmd:
+                return 0, "203.0.113.10 dev vd-test table 51820 src 10.8.0.2", ""
+            return 0, "", ""
+
+        guard = EndpointBypass(fake_run, os.path.join(self.temp, "policy.log"))
+        result = guard.verify(
+            "vd-test",
+            [{
+                "source": "203.0.113.10:51820",
+                "ip": "203.0.113.10",
+                "proto": "-4",
+                "cidr": "203.0.113.10/32",
+            }],
+        )
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["checks"][0]["direct_rule"])
+
     def test_ipv6_endpoint_parser(self):
         self.assertEqual(self.guard.split_endpoint("[2001:db8::1]:51820"), ("2001:db8::1", 51820))
 
