@@ -88,6 +88,7 @@ export interface Analysis {
   persistent_keepalive: boolean;
   mtu: string | null;
   suggested_name?: string;
+  source_format?: string;
 }
 
 export interface InspectResult {
