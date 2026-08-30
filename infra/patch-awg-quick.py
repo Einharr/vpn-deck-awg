@@ -45,16 +45,12 @@ set_endpoint_direct_route() {
         fi
         cidr="$host/$mask"
 
-        # awg show normally returns a resolved numeric endpoint. Verify that
-        # main routing can reach it and that it is not already the tunnel.
         route_info="$(ip $proto route get "$host" 2>/dev/null | head -n1)"
         [[ -n $route_info ]] || continue
         [[ $route_info =~ dev\ ([^ ]+) ]] || continue
         dev="${BASH_REMATCH[1]}"
         [[ $dev != "$INTERFACE" ]] || continue
 
-        # Respect an already-existing equivalent rule; only remember and
-        # remove rules that this instance actually created.
         if ip $proto rule show 2>/dev/null | grep -Fq "to $cidr lookup main"; then
             continue
         fi
@@ -110,13 +106,21 @@ def main() -> int:
     if PATCH_MARKER in text:
         return 0
 
-    # SteamOS uses systemd-resolved/resolvectl rather than openresolv.
     if "cmd resolvectl dns" not in text:
         dns_start = text.find("resolvconf_iface_prefix() {")
         dns_end = text.find("add_route() {", dns_start)
         if dns_start < 0 or dns_end < 0:
             raise RuntimeError("could not find upstream DNS block")
         text = text[:dns_start] + DNS_STEAMOS + "\n" + text[dns_end:]
+
+    # Fresh awg-quick invocations must not inherit the private environment
+    # variables used by amneziawg-go after it re-execs as a foreground daemon.
+    # If WG_PROCESS_FOREGROUND=1 leaks in, the command blocks here forever.
+    text = replace_once(
+        text,
+        '\t\tcmd "${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}" "$INTERFACE"\n',
+        '\t\tcmd env -u WG_TUN_FD -u WG_UAPI_FD -u WG_PROCESS_FOREGROUND "${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}" "$INTERFACE"\n',
+    )
 
     text = replace_once(
         text,
