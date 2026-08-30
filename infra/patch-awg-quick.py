@@ -136,6 +136,17 @@ def main() -> int:
         '\t# Preserve physical reachability of the VPN transport before full-tunnel rules.\n\tset_endpoint_direct_route\n' + route_loop,
     )
 
+    # Current upstream cmd_down invokes DNS/firewall cleanup a second time
+    # after del_if has already done it before deleting the interface. On
+    # SteamOS that duplicate resolvectl call reports "No such device" despite
+    # a successful shutdown. Keep only the correctly ordered cleanup in del_if.
+    duplicate_cleanup = '\tdel_if\n\tunset_dns || true\n\tremove_firewall || true\n'
+    text = replace_once(
+        text,
+        duplicate_cleanup,
+        '\t# vpn-deck-awg: del_if already handles DNS/firewall cleanup\n\tdel_if\n',
+    )
+
     path.write_text(text, encoding="utf-8")
     return 0
 
