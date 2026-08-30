@@ -19,6 +19,8 @@ from typing import Any, Dict, Iterable, Optional
 
 SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 KEY_RE = re.compile(r"^\s*([^=]+?)\s*=")
+INTERFACE_SECTION_RE = re.compile(r"^\s*\[interface\]\s*$", re.IGNORECASE | re.MULTILINE)
+PEER_SECTION_RE = re.compile(r"^\s*\[peer\]\s*$", re.IGNORECASE | re.MULTILINE)
 
 # Normalized JSON key -> canonical awg-quick config key.
 AWG_FIELDS = {
@@ -53,8 +55,10 @@ def _normalise_key(value: object) -> str:
 
 
 def _looks_like_conf(text: str) -> bool:
-    lower = text.lower()
-    return "[interface]" in lower and "[peer]" in lower
+    # Do not use substring checks here: JSON/vpn payloads often contain an
+    # escaped embedded config string, which includes the literal words
+    # "[Interface]" and "[Peer]" but not real INI section lines.
+    return bool(INTERFACE_SECTION_RE.search(text) and PEER_SECTION_RE.search(text))
 
 
 def _walk(value: Any, depth: int = 0) -> Iterable[Any]:
