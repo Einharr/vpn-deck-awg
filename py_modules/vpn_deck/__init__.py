@@ -1,7 +1,7 @@
 """VPN Deck AWG core modules."""
 
 from .binary_manager import BinaryManager
-from .config_manager import ConfigManager
+from .config_manager_ext import ConfigManager
 from .diagnostics import Diagnostics
 from .protocol import analyse_config, detect_protocol
 from .service_manager import ServiceManager
