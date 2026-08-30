@@ -24,8 +24,9 @@ export const mutedStyle: CSSProperties = {
   lineHeight: 1.35,
 };
 
-export function protocolTone(protocol: string): string {
-  if (protocol === "awg-3.0") return "#66c0f4";
+export function protocolTone(protocol?: string | null): string {
+  if (!protocol) return "#b8b8b8";
+  if (protocol === "awg-3.1" || protocol === "awg-3.0") return "#66c0f4";
   if (protocol === "awg-2.0") return "#86b342";
   if (protocol.startsWith("awg-")) return "#c7a96b";
   return "#b8b8b8";

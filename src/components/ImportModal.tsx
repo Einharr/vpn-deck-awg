@@ -32,9 +32,7 @@ export function ImportModal({
   const [inspectError] = useState<string | null>(initialError);
 
   const pickFile = async () => {
-    // Decky's picker is itself a ModalRoot. Keeping this modal alive while
-    // opening it creates a nested modal that is dimmed and loses controller
-    // focus in Game Mode. Close first, then open the system picker.
+    // Keep the beta.3 flow: close our modal before Decky's own picker opens.
     closeModal?.();
     await new Promise((resolve) => window.setTimeout(resolve, 80));
 
@@ -47,18 +45,22 @@ export function ImportModal({
         undefined,
         ["conf"],
       );
-      const inspected = await inspectConfig({ path: selected.realpath });
+      const selectedPath = selected?.realpath || selected?.path;
+      if (!selectedPath) {
+        toaster.toast({ title: "Файл не выбран", body: "Decky не вернул путь к конфигу" });
+        return;
+      }
+      const inspected = await inspectConfig({ path: selectedPath });
       showModal(
         <ImportModal
           onImported={onImported}
-          initialPath={selected.realpath}
-          initialAnalysis={inspected.analysis ?? null}
-          initialError={inspected.success ? null : inspected.error ?? "Конфиг не прошёл проверку"}
+          initialPath={selectedPath}
+          initialAnalysis={inspected?.analysis ?? null}
+          initialError={inspected?.success ? null : inspected?.error ?? "Конфиг не прошёл проверку"}
         />,
       );
     } catch (error) {
       const message = String(error);
-      // Canceling Decky's picker is normal navigation, not an import error.
       if (!message.toLowerCase().includes("cancel")) {
         toaster.toast({ title: "Не удалось открыть файл", body: message });
       }
@@ -83,7 +85,7 @@ export function ImportModal({
         });
         return;
       }
-      toaster.toast({ title: "Профиль добавлен", body: analysis.protocol_label });
+      toaster.toast({ title: "Профиль добавлен", body: analysis.protocol_label || "VPN" });
       await onImported();
       closeModal?.();
     } catch (error) {
@@ -93,13 +95,17 @@ export function ImportModal({
     }
   };
 
+  const warnings = analysis?.warnings ?? [];
+  const errors = analysis?.errors ?? [];
+  const endpoints = analysis?.endpoints ?? [];
+
   return (
     <ModalRoot onCancel={closeModal} closeModal={closeModal}>
       <DialogHeader>{path ? "Проверка VPN-профиля" : "Добавить VPN-профиль"}</DialogHeader>
       <DialogBody>
         {!path && (
           <div style={{ ...mutedStyle, marginBottom: "10px" }}>
-            Поддерживаются WireGuard, AmneziaWG 1.x/2/3 и Amnezia vpn:// / JSON, сохранённые в файл.
+            Поддерживаются WireGuard, AmneziaWG 1.x/2/3.x и Amnezia vpn:// / JSON, сохранённые в файл.
           </div>
         )}
 
@@ -112,21 +118,21 @@ export function ImportModal({
         {analysis && (
           <div style={{ ...cardStyle, marginTop: "12px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
-              <strong style={{ color: protocolTone(analysis.protocol) }}>{analysis.protocol_label}</strong>
-              <span style={mutedStyle}>{analysis.peer_count} peer</span>
+              <strong style={{ color: protocolTone(analysis.protocol) }}>{analysis.protocol_label || "Неизвестный формат"}</strong>
+              <span style={mutedStyle}>{analysis.peer_count ?? 0} peer</span>
             </div>
             {analysis.source_format && (
               <div style={{ ...mutedStyle, marginTop: "4px" }}>Источник: {analysis.source_format}</div>
             )}
             <div style={{ ...mutedStyle, marginTop: "7px" }}>
-              {analysis.endpoints[0] ?? "Endpoint не указан"}
+              {endpoints[0] ?? "Endpoint не указан"}
             </div>
             <div style={{ ...mutedStyle, marginTop: "3px" }}>
               {analysis.full_tunnel ? "Полный туннель" : "Split tunnel"}
               {analysis.has_ipv6 ? " · IPv6" : ""}
               {analysis.persistent_keepalive ? " · Keepalive" : ""}
             </div>
-            {analysis.warnings.map((warning) => (
+            {warnings.map((warning) => (
               <div key={warning} style={{ ...mutedStyle, marginTop: "5px" }}>⚠ {warning}</div>
             ))}
           </div>
@@ -136,7 +142,7 @@ export function ImportModal({
           <div style={{ ...cardStyle, marginTop: "12px", borderColor: "rgba(220,90,90,.55)" }}>
             <strong>Конфиг не принят</strong>
             {inspectError && <div style={{ ...mutedStyle, marginTop: "6px" }}>{inspectError}</div>}
-            {analysis?.errors.map((error) => (
+            {errors.map((error) => (
               <div key={error} style={{ ...mutedStyle, marginTop: "5px" }}>{error}</div>
             ))}
           </div>

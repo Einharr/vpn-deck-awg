@@ -28,13 +28,17 @@ class ConfigManager(BaseConfigManager):
     def inspect_file(self, path: str) -> Dict:
         source = self._load_source(path)
         if not source.get("success"):
-            return {
-                "valid": False,
-                "errors": [source.get("error") or "Unsupported config source"],
-                "warnings": [],
-                "source_format": source.get("format", "unknown"),
-                "suggested_name": self.sanitize_name(os.path.basename(path or "vpn")),
-            }
+            # Always return the same metadata shape as validate_config(). The
+            # beta.3 UI renders this object even for rejected files; returning
+            # a partial dict made protocolTone(undefined) crash Steam's React
+            # tree before the actual validation error could be shown.
+            result = self.validate_config("")
+            result["valid"] = False
+            result["errors"] = [source.get("error") or "Unsupported config source"]
+            result["warnings"] = []
+            result["source_format"] = source.get("format", "unknown")
+            result["suggested_name"] = self.sanitize_name(os.path.basename(path or "vpn"))
+            return result
 
         result = self.validate_config(source["content"])
         result["source_format"] = source.get("format", "conf")
