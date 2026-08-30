@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Apply the SteamOS endpoint underlay-route fix to upstream awg-quick.
+"""Apply SteamOS-specific fixes to upstream awg-quick.
 
-The patch is intentionally structural rather than a long-lived fork of the
-script. It fails loudly if upstream changes the expected anchors.
+The patch is structural rather than a long-lived fork. Besides using
+systemd-resolved, it installs a destination policy rule for every resolved
+peer endpoint before full-tunnel routing is created. This is important for
+userspace amneziawg-go: if its UDP socket is ever observed without the tunnel
+fwmark, the normal `not fwmark -> table 51820` rule would otherwise route the
+VPN transport into the VPN itself and produce `sendmsg: network is unreachable`.
 """
 
 from __future__ import annotations
@@ -14,36 +18,51 @@ import sys
 PATCH_MARKER = "vpn-deck-awg: endpoint-direct-route"
 FUNCTIONS = r'''
 # vpn-deck-awg: endpoint-direct-route
+# Force the transport destination through the physical/main routing table.
+# This rule has a much lower preference number than wg-quick's generated
+# full-tunnel rules (~32764), so it wins even if a userspace socket packet is
+# temporarily missing the WireGuard fwmark.
 ENDPOINT_ROUTE_STATE_DIR="/var/run/awg-quick"
+ENDPOINT_RULE_PREF=10000
 
 _endpoint_route_state_file() {
-    echo "$ENDPOINT_ROUTE_STATE_DIR/${INTERFACE}.endpoint-routes"
+    echo "$ENDPOINT_ROUTE_STATE_DIR/${INTERFACE}.endpoint-rules"
 }
 
 set_endpoint_direct_route() {
-    local endpoint host proto mask route_info gw dev state_file
+    local endpoint host proto mask cidr route_info dev state_file
     state_file="$(_endpoint_route_state_file)"
     mkdir -p "$ENDPOINT_ROUTE_STATE_DIR" 2>/dev/null || return 0
     : > "$state_file" 2>/dev/null || return 0
+
     while read -r _ endpoint; do
-        [[ $endpoint =~ ^\[?([a-z0-9:.]+)\]?:[0-9]+$ ]] || continue
+        [[ $endpoint =~ ^\[?([A-Za-z0-9_.:%-]+)\]?:[0-9]+$ ]] || continue
         host="${BASH_REMATCH[1]}"
         if [[ $host == *:* ]]; then
             proto=-6; mask=128
         else
             proto=-4; mask=32
         fi
+        cidr="$host/$mask"
+
+        # awg show normally returns a resolved numeric endpoint. Verify that
+        # main routing can reach it and that it is not already the tunnel.
         route_info="$(ip $proto route get "$host" 2>/dev/null | head -n1)"
         [[ -n $route_info ]] || continue
-        [[ $route_info =~ via\ ([^ ]+) ]] || continue
-        gw="${BASH_REMATCH[1]}"
         [[ $route_info =~ dev\ ([^ ]+) ]] || continue
         dev="${BASH_REMATCH[1]}"
         [[ $dev != "$INTERFACE" ]] || continue
-        if cmd ip $proto route replace "$host/$mask" via "$gw" dev "$dev"; then
-            echo "$proto $host/$mask" >> "$state_file"
+
+        # Respect an already-existing equivalent rule; only remember and
+        # remove rules that this instance actually created.
+        if ip $proto rule show 2>/dev/null | grep -Fq "to $cidr lookup main"; then
+            continue
+        fi
+        if cmd ip $proto rule add pref "$ENDPOINT_RULE_PREF" to "$cidr" lookup main; then
+            echo "$proto $cidr" >> "$state_file"
         fi
     done < <(awg show "$INTERFACE" endpoints 2>/dev/null)
+
     [[ -s $state_file ]] || rm -f "$state_file"
 }
 
@@ -53,7 +72,7 @@ del_endpoint_direct_route() {
     [[ -f $state_file ]] || return 0
     while read -r proto cidr; do
         [[ -n $proto && -n $cidr ]] || continue
-        cmd ip $proto route del "$cidr" 2>/dev/null || true
+        cmd ip $proto rule del pref "$ENDPOINT_RULE_PREF" to "$cidr" lookup main 2>/dev/null || true
     done < "$state_file"
     rm -f "$state_file"
 }
@@ -73,6 +92,7 @@ unset_dns() {
 \tcmd resolvectl revert "$INTERFACE"
 }
 '''
+
 
 def replace_once(text: str, needle: str, replacement: str) -> str:
     count = text.count(needle)
@@ -109,7 +129,7 @@ def main() -> int:
     text = replace_once(
         text,
         route_loop,
-        '\t# Preserve a direct underlay route to peer endpoints before the tunnel changes routing.\n\tset_endpoint_direct_route\n' + route_loop,
+        '\t# Preserve physical reachability of the VPN transport before full-tunnel rules.\n\tset_endpoint_direct_route\n' + route_loop,
     )
 
     path.write_text(text, encoding="utf-8")
