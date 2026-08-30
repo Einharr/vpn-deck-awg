@@ -184,9 +184,12 @@ class EndpointBypass:
                 quiet=True,
             )
             rule_text = rules_out or rules_err
+            # iproute2 usually prints host rules without /32 or /128 even when
+            # the add command used CIDR notation. Accept both representations.
+            destination_forms = (f"to {item['ip']}", f"to {item['cidr']}")
             direct_rule = (
                 rc_rules == 0
-                and f"to {item['cidr']}" in rules_out
+                and any(form in rules_out for form in destination_forms)
                 and ("lookup main" in rules_out or "table main" in rules_out)
             )
 
