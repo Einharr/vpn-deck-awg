@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 from datetime import datetime
 from typing import Dict, List, Optional, Set
@@ -41,38 +42,81 @@ class ServiceManager:
             )
             return result.returncode, result.stdout.strip(), result.stderr.strip()
         except subprocess.TimeoutExpired:
-            return 1, "", f"timeout after {timeout}s"
+            return 124, "", f"timeout after {timeout}s"
         except FileNotFoundError:
             return 127, "", f"{cmd[0]}: command not found"
 
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen) -> None:
+        """Terminate an awg-quick process and every child in its session."""
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                return
+
+        try:
+            process.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                return
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
     def _run_logged(self, cmd: List[str], timeout: int = START_STOP_TIMEOUT_SEC):
         cmd_str = " ".join(str(c) for c in cmd)
+        process: Optional[subprocess.Popen] = None
         try:
             os.makedirs(os.path.dirname(AWG_QUICK_LOG), exist_ok=True)
             with open(AWG_QUICK_LOG, "a", encoding="utf-8") as log_file:
                 log_file.write(f"\n--- {datetime.now().isoformat()} | {cmd_str} ---\n")
                 log_file.flush()
-                result = subprocess.run(
+                process = subprocess.Popen(
                     cmd,
                     stdout=log_file,
                     stderr=log_file,
                     text=True,
-                    timeout=timeout,
                     start_new_session=True,
                     env=clean_env(),
-                    check=False,
                 )
-                log_file.write(f"--- RC: {result.returncode} ---\n")
+                try:
+                    returncode = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    log_file.write(f"\n--- TIMEOUT after {timeout}s; terminating process group ---\n")
+                    log_file.flush()
+                    self._terminate_process_group(process)
+                    log_file.write("--- RC: 124 (timeout) ---\n")
+                    log_file.flush()
+                    return 124, "", f"timeout after {timeout}s; awg-quick process group terminated"
+
+                log_file.write(f"--- RC: {returncode} ---\n")
+                log_file.flush()
 
             error_tail = ""
-            if result.returncode != 0:
+            if returncode != 0:
                 error_tail = self.get_log_tail(24)
-            return result.returncode, "", error_tail
-        except subprocess.TimeoutExpired:
-            return 1, "", f"timeout after {timeout}s"
+            return returncode, "", error_tail
         except FileNotFoundError:
             return 127, "", f"{cmd[0]}: command not found"
         except OSError as exc:
+            if process is not None and process.poll() is None:
+                self._terminate_process_group(process)
             return 1, "", str(exc)
 
     def get_log_tail(self, lines: int = 60) -> str:
