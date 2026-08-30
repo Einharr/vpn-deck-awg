@@ -35,7 +35,10 @@ jobs:
           test -x binaries/amneziawg-go
           test -x binaries/awg
           test -x binaries/awg-quick
+          bash -n binaries/awg-quick
           grep -q 'endpoint-direct-route' binaries/awg-quick
+          grep -q 'ENDPOINT_RULE_PREF=10000' binaries/awg-quick
+          grep -q 'rule add pref.*to.*lookup main' binaries/awg-quick
           cat binaries/versions.json
 
       - name: Package Decky plugin
