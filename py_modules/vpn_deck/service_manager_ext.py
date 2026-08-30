@@ -6,6 +6,8 @@ import os
 import time
 from typing import Dict, List, Optional
 
+import decky
+
 from .protocol import analyse_config
 from .service_manager import AWG_QUICK_LOG, MANAGED_PREFIX, ServiceManager as BaseServiceManager
 from .transport import EndpointBypass
@@ -28,6 +30,39 @@ class ServiceManager(BaseServiceManager):
             "endpoints": list(analysis.get("endpoints") or []),
             "full_tunnel": bool(analysis.get("full_tunnel")),
         }
+
+    def _runtime_endpoints(self, interface: str) -> List[str]:
+        """Return the concrete endpoints selected by awg after setconf.
+
+        Hostnames may resolve to different addresses between the Python
+        preflight and awg's own setconf. The runtime value is therefore the
+        useful one for postflight diagnostics.
+        """
+        awg = self.binary_manager.get_binary_path("awg")
+        if not awg:
+            return []
+        rc, stdout, _ = self._run([awg, "show", interface, "endpoints"], quiet=True)
+        if rc != 0 or not stdout:
+            return []
+
+        endpoints: List[str] = []
+        for line in stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            endpoint = parts[-1].strip()
+            if endpoint and endpoint != "(none)":
+                endpoints.append(endpoint)
+        return endpoints
+
+    @staticmethod
+    def _append_warning(message: str) -> None:
+        decky.logger.warning(message)
+        try:
+            with open(AWG_QUICK_LOG, "a", encoding="utf-8") as handle:
+                handle.write(f"[vpn-deck-awg] WARNING: {message}\n")
+        except OSError:
+            pass
 
     def _recover_incomplete_interface(self, interface: str) -> Dict:
         """Remove a half-created userspace interface left by a failed start.
@@ -127,18 +162,20 @@ class ServiceManager(BaseServiceManager):
                 "transport_bypass": bypass,
             }
 
-        route_check = self.endpoint_bypass.verify(interface, bypass.get("resolved", []))
+        # awg-quick has now resolved the actual peer endpoint and installed its
+        # own destination policy rule. Prefer that concrete runtime endpoint for
+        # diagnostics. Crucially, postflight diagnostics are NOT allowed to
+        # tear down an interface that awg-quick successfully brought up.
+        runtime_endpoints = self._runtime_endpoints(interface)
+        runtime_resolved = self.endpoint_bypass.resolve(runtime_endpoints)
+        checked = runtime_resolved or bypass.get("resolved", [])
+        route_check = self.endpoint_bypass.verify(interface, checked)
+        transport_warning = None
         if full_tunnel and not route_check.get("success"):
-            self._run_logged([awg_quick, "down", interface])
-            self.endpoint_bypass.remove(interface)
-            return {
-                "success": False,
-                "interface": interface,
-                "method": "postflight",
-                "error": route_check.get("error"),
-                "transport_bypass": bypass,
-                "transport_routes": route_check.get("checks", []),
-            }
+            transport_warning = route_check.get("error") or "Endpoint route verification was inconclusive"
+            self._append_warning(
+                f"Postflight route verification for {interface} was inconclusive; keeping the active tunnel: {transport_warning}"
+            )
 
         return {
             "success": True,
@@ -147,6 +184,8 @@ class ServiceManager(BaseServiceManager):
             "error": None,
             "transport_bypass": bypass,
             "transport_routes": route_check.get("checks", []),
+            "transport_warning": transport_warning,
+            "runtime_endpoints": runtime_endpoints,
             "recovered_stale_interface": bool(recovery.get("recovered")),
         }
 
