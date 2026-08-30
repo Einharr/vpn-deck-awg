@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Dict, List, Optional
 
 from .protocol import analyse_config
@@ -28,6 +29,37 @@ class ServiceManager(BaseServiceManager):
             "full_tunnel": bool(analysis.get("full_tunnel")),
         }
 
+    def _recover_incomplete_interface(self, interface: str) -> Dict:
+        """Remove a half-created userspace interface left by a failed start.
+
+        amneziawg-go creates the TUN/UAPI before awg-quick applies setconf. If
+        awg-quick is interrupted at that point, the interface can survive with
+        zero configured peers. Treat that state as incomplete rather than as
+        an already-connected VPN.
+        """
+        rc_link, _, _ = self._run(["ip", "link", "show", "dev", interface], quiet=True)
+        if rc_link != 0:
+            return {"success": True, "recovered": False}
+
+        if interface in self.active_interfaces():
+            status = self.get_status(interface)
+            if status.get("peers"):
+                return {"success": True, "recovered": False, "already_active": True}
+
+        self.endpoint_bypass.remove(interface)
+        rc, _, error = self._run(["ip", "link", "delete", "dev", interface])
+        if rc != 0:
+            return {
+                "success": False,
+                "recovered": False,
+                "error": error or f"Could not remove incomplete interface {interface}",
+            }
+
+        # Give the userspace daemon a moment to observe the deleted TUN and
+        # close/remove its UAPI socket before starting the same name again.
+        time.sleep(0.15)
+        return {"success": True, "recovered": True}
+
     def start_interface(
         self,
         interface: str,
@@ -36,7 +68,16 @@ class ServiceManager(BaseServiceManager):
     ) -> Dict:
         if not self._safe_interface(interface):
             return {"success": False, "interface": interface, "method": None, "error": "Invalid interface name"}
-        if interface in self.active_interfaces():
+
+        recovery = self._recover_incomplete_interface(interface)
+        if not recovery.get("success"):
+            return {
+                "success": False,
+                "interface": interface,
+                "method": "stale-interface-cleanup",
+                "error": recovery.get("error"),
+            }
+        if recovery.get("already_active"):
             return {"success": True, "interface": interface, "method": "already-active", "error": None}
 
         awg_quick = self.binary_manager.get_binary_path("awg-quick")
@@ -64,6 +105,9 @@ class ServiceManager(BaseServiceManager):
         rc, _, stderr = self._run_logged([awg_quick, "up", interface])
         if rc != 0:
             self.endpoint_bypass.remove(interface)
+            # awg-quick normally cleans up itself, but a killed userspace
+            # fallback can leave a TUN behind. Remove only an unconfigured one.
+            self._recover_incomplete_interface(interface)
             return {
                 "success": False,
                 "interface": interface,
@@ -74,6 +118,7 @@ class ServiceManager(BaseServiceManager):
 
         if interface not in self.active_interfaces():
             self.endpoint_bypass.remove(interface)
+            self._recover_incomplete_interface(interface)
             return {
                 "success": False,
                 "interface": interface,
@@ -102,6 +147,7 @@ class ServiceManager(BaseServiceManager):
             "error": None,
             "transport_bypass": bypass,
             "transport_routes": route_check.get("checks", []),
+            "recovered_stale_interface": bool(recovery.get("recovered")),
         }
 
     def stop_interface(self, interface: str) -> Dict:
